@@ -86,6 +86,41 @@ local keyChoices = {
 
 local currentTarget = nil
 local selectedTeleportPlayer = nil
+local savedLocations = {}
+local selectedSavedLocation = nil
+local saveLocationName = "Location"
+local manualCoordinateText = ""
+
+local complexAim = {
+    enabled = false,
+    teamCheck = true,
+    wallCheck = true,
+    aimPart = "Head",
+    fov = 120,
+    sensitivity = 0.18,
+    maxDistance = 500,
+    predictionEnabled = false,
+    predictionStrength = 1,
+    bulletSpeed = 900,
+    bulletDropEnabled = false,
+    bulletDropScale = 1,
+    targetLock = true,
+    autoDetectBallistics = true,
+}
+local complexLockedTarget = nil
+local ballisticLastScan = 0
+local ballisticScanInterval = 1
+local ballisticLastWeapon = nil
+local detectedBallistics = {
+    weapon = "None",
+    speed = complexAim.bulletSpeed,
+    dropEnabled = complexAim.bulletDropEnabled,
+    dropScale = complexAim.bulletDropScale,
+    source = "Manual/default",
+    found = 0,
+}
+local predictionAnalysis = "No prediction check yet."
+
 local Chillys = nil
 local targetDiedConnection = nil
 local targetCharacterRemovingConnection = nil
@@ -1211,6 +1246,501 @@ local function cycleTeleportPlayer()
     selectedTeleportPlayer = list[nextIndex]
 end
 
+local function getCoordinateString()
+    local root = getLocalRootPart()
+    if not root then
+        return nil
+    end
+
+    local position = root.Position
+    return string.format("%.2f, %.2f, %.2f", position.X, position.Y, position.Z)
+end
+
+local function parseVector3(text)
+    local numbers = {}
+
+    for rawNumber in string.gmatch(tostring(text or ""), "[-+]?%d*%.?%d+") do
+        local number = tonumber(rawNumber)
+        if number then
+            table.insert(numbers, number)
+        end
+
+        if #numbers >= 3 then
+            break
+        end
+    end
+
+    if #numbers < 3 then
+        return nil
+    end
+
+    return Vector3.new(numbers[1], numbers[2], numbers[3])
+end
+
+local function teleportToCFrame(targetCFrame)
+    local character = getCharacter(localPlayer)
+    local root = getLocalRootPart()
+
+    if not character or not root or typeof(targetCFrame) ~= "CFrame" then
+        return false
+    end
+
+    pcall(function()
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+    end)
+
+    local success = pcall(function()
+        character:PivotTo(targetCFrame)
+    end)
+
+    if not success then
+        root.CFrame = targetCFrame
+    end
+
+    return true
+end
+
+local function getSavedLocationNames()
+    local names = {}
+    for name in pairs(savedLocations) do
+        table.insert(names, name)
+    end
+    table.sort(names)
+    return names
+end
+
+local function cycleSavedLocation()
+    local names = getSavedLocationNames()
+    if #names == 0 then
+        selectedSavedLocation = nil
+        return
+    end
+
+    local currentIndex = table.find(names, selectedSavedLocation) or 0
+    local nextIndex = currentIndex + 1
+    if nextIndex > #names then
+        nextIndex = 1
+    end
+
+    selectedSavedLocation = names[nextIndex]
+end
+
+local function getComplexAimPart(character)
+    if not character then
+        return nil
+    end
+
+    if complexAim.aimPart == "Head" then
+        return character:FindFirstChild("Head")
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("Head")
+end
+
+local function getComplexTargetDistance(player)
+    local localRoot = getLocalRootPart()
+    local targetRoot = getRootPart(getCharacter(player))
+
+    if not localRoot or not targetRoot then
+        return math.huge
+    end
+
+    return (localRoot.Position - targetRoot.Position).Magnitude
+end
+
+local function isComplexTargetVisible(part, character)
+    if not complexAim.wallCheck then
+        return true
+    end
+
+    camera = workspace.CurrentCamera
+    if not camera or not part or not character then
+        return false
+    end
+
+    local origin = camera.CFrame.Position
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {localPlayer.Character}
+
+    local result = workspace:Raycast(origin, part.Position - origin, raycastParams)
+    return not result or result.Instance:IsDescendantOf(character)
+end
+
+local function isValidComplexTarget(player)
+    if player == localPlayer or not isAlive(player) then
+        return false
+    end
+
+    if complexAim.teamCheck and isSameTeam(player) then
+        return false
+    end
+
+    if getComplexTargetDistance(player) > complexAim.maxDistance then
+        return false
+    end
+
+    local character = getCharacter(player)
+    local part = getComplexAimPart(character)
+    return part ~= nil and isComplexTargetVisible(part, character)
+end
+
+local function getSortedComplexTargets()
+    camera = workspace.CurrentCamera
+    if not camera then
+        return {}
+    end
+
+    local center = Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y / 2)
+    local targets = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidComplexTarget(player) then
+            local character = getCharacter(player)
+            local part = getComplexAimPart(character)
+            local screenPosition, onScreen = camera:WorldToViewportPoint(part.Position)
+
+            if onScreen and screenPosition.Z > 0 then
+                local screenDistance = (Vector2.new(screenPosition.X, screenPosition.Y) - center).Magnitude
+                if screenDistance <= complexAim.fov then
+                    table.insert(targets, {
+                        player = player,
+                        part = part,
+                        screenDistance = screenDistance,
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(targets, function(first, second)
+        return first.screenDistance < second.screenDistance
+    end)
+
+    return targets
+end
+
+local function switchComplexTarget()
+    local targets = getSortedComplexTargets()
+    if #targets == 0 then
+        complexLockedTarget = nil
+        return
+    end
+
+    local nextIndex = 1
+    if complexLockedTarget then
+        for index, target in ipairs(targets) do
+            if target.player == complexLockedTarget then
+                nextIndex = index + 1
+                break
+            end
+        end
+    end
+
+    if nextIndex > #targets then
+        nextIndex = 1
+    end
+
+    complexLockedTarget = targets[nextIndex].player
+end
+
+local function getCurrentComplexTarget()
+    if complexAim.targetLock then
+        if not complexLockedTarget or not isValidComplexTarget(complexLockedTarget) then
+            local targets = getSortedComplexTargets()
+            complexLockedTarget = targets[1] and targets[1].player or nil
+        end
+
+        if complexLockedTarget then
+            return complexLockedTarget, getComplexAimPart(getCharacter(complexLockedTarget))
+        end
+
+        return nil, nil
+    end
+
+    local targets = getSortedComplexTargets()
+    local target = targets[1]
+    return target and target.player or nil, target and target.part or nil
+end
+
+local function getPredictedComplexPosition(part)
+    if not part then
+        return nil
+    end
+
+    local position = part.Position
+    if not complexAim.predictionEnabled then
+        return position
+    end
+
+    camera = workspace.CurrentCamera
+    local origin = camera and camera.CFrame.Position
+    if not origin then
+        return position
+    end
+
+    local travelTime = (position - origin).Magnitude / math.max(complexAim.bulletSpeed, 1)
+    local character = part.Parent
+    local root = getRootPart(character)
+    local velocity = root and root.AssemblyLinearVelocity or part.AssemblyLinearVelocity
+    local predicted = position + (velocity * travelTime * complexAim.predictionStrength)
+
+    if complexAim.bulletDropEnabled then
+        predicted = predicted + Vector3.new(
+            0,
+            0.5 * workspace.Gravity * travelTime * travelTime * complexAim.bulletDropScale,
+            0
+        )
+    end
+
+    return predicted
+end
+
+local function getEquippedWeapon()
+    local character = getCharacter(localPlayer)
+    if character then
+        local equipped = character:FindFirstChildOfClass("Tool")
+        if equipped then
+            return equipped
+        end
+    end
+
+    local backpack = localPlayer:FindFirstChildOfClass("Backpack")
+    return backpack and backpack:FindFirstChildOfClass("Tool") or nil
+end
+
+local function normalizeBallisticKey(name)
+    return string.lower(tostring(name or "")):gsub("[%s_%-]", "")
+end
+
+local function isBulletSpeedKey(name)
+    local key = normalizeBallisticKey(name)
+    if key:find("reload")
+        or key:find("firerate")
+        or key:find("walk")
+        or key:find("sprint")
+        or key:find("aim")
+        or key:find("scope") then
+        return false
+    end
+
+    return key:find("bulletspeed")
+        or key:find("projectilespeed")
+        or key:find("projectilevelocity")
+        or key:find("bulletvelocity")
+        or key:find("muzzlevelocity")
+        or key:find("travelspeed")
+        or key == "speed"
+        or key == "velocity"
+end
+
+local function isBulletDropKey(name)
+    local key = normalizeBallisticKey(name)
+    if key:find("body") or key:find("player") or key:find("world") then
+        return false
+    end
+
+    return key:find("bulletdrop")
+        or key:find("projectiledrop")
+        or key == "drop"
+        or key == "gravity"
+        or key:find("bulletgravity")
+        or key:find("projectilegravity")
+end
+
+local function getDropScaleFromValue(name, value)
+    local numeric = tonumber(value) or 0
+    local absolute = math.abs(numeric)
+    local key = normalizeBallisticKey(name)
+
+    if absolute == 0 then
+        return 0
+    end
+
+    if key:find("gravity") or absolute > 10 then
+        return math.clamp(absolute / math.max(workspace.Gravity, 1), 0, 5)
+    end
+
+    return math.clamp(absolute, 0, 5)
+end
+
+local function recordBallisticCandidate(result, name, value, source)
+    if type(name) ~= "string" or type(value) ~= "number" then
+        return
+    end
+
+    if isBulletSpeedKey(name) and value > 0 then
+        result.speed = math.clamp(value, 100, 20000)
+        result.speedSource = source .. "." .. name
+    elseif isBulletDropKey(name) then
+        result.dropEnabled = value ~= 0
+        result.dropScale = getDropScaleFromValue(name, value)
+        result.dropSource = source .. "." .. name
+    end
+end
+
+local function scanBallisticAttributes(instance, source, result)
+    for key, value in pairs(instance:GetAttributes()) do
+        result.found = result.found + 1
+        if type(value) == "number" then
+            recordBallisticCandidate(result, key, value, source .. "@Attributes")
+        end
+    end
+end
+
+local function scanWeaponBallistics(weapon)
+    local result = {
+        weapon = weapon and weapon.Name or "None",
+        speed = nil,
+        speedSource = nil,
+        dropEnabled = nil,
+        dropScale = nil,
+        dropSource = nil,
+        found = 0,
+    }
+
+    if not weapon then
+        return result
+    end
+
+    scanBallisticAttributes(weapon, weapon.Name, result)
+
+    for _, item in ipairs(weapon:GetDescendants()) do
+        scanBallisticAttributes(item, item.Name, result)
+
+        if item:IsA("NumberValue") or item:IsA("IntValue") then
+            result.found = result.found + 1
+            recordBallisticCandidate(result, item.Name, item.Value, item.Name)
+        end
+    end
+
+    return result
+end
+
+local function applyBallisticResult(result)
+    if not result then
+        return
+    end
+
+    local sources = {}
+
+    if result.speed and result.speed > 0 then
+        complexAim.bulletSpeed = math.clamp(result.speed, 100, 20000)
+        table.insert(sources, "speed=" .. tostring(result.speedSource or "unknown"))
+    end
+
+    if result.dropEnabled ~= nil then
+        complexAim.bulletDropEnabled = result.dropEnabled
+        complexAim.bulletDropScale = math.clamp(result.dropScale or complexAim.bulletDropScale, 0, 5)
+        table.insert(sources, "drop=" .. tostring(result.dropSource or "unknown"))
+    end
+
+    detectedBallistics = {
+        weapon = result.weapon or "None",
+        speed = complexAim.bulletSpeed,
+        dropEnabled = complexAim.bulletDropEnabled,
+        dropScale = complexAim.bulletDropScale,
+        source = #sources > 0 and table.concat(sources, " | ") or "Manual/default",
+        found = result.found or 0,
+    }
+end
+
+local function autoDetectBallistics(force)
+    if not complexAim.autoDetectBallistics and not force then
+        return false
+    end
+
+    local now = os.clock()
+    local weapon = getEquippedWeapon()
+
+    if not force
+        and weapon == ballisticLastWeapon
+        and now - ballisticLastScan < ballisticScanInterval then
+        return false
+    end
+
+    ballisticLastWeapon = weapon
+    ballisticLastScan = now
+
+    if not weapon then
+        detectedBallistics.weapon = "None"
+        detectedBallistics.source = "Weapon not found"
+        detectedBallistics.found = 0
+        return false
+    end
+
+    applyBallisticResult(scanWeaponBallistics(weapon))
+    return true
+end
+
+local function analyzePredictionSettings()
+    autoDetectBallistics(true)
+    complexAim.predictionEnabled = true
+    complexAim.predictionStrength = 1
+
+    local player, part = getCurrentComplexTarget()
+    if not player or not part then
+        predictionAnalysis = string.format(
+            "No active target | Bullet %.0f | Drop %s %.2f",
+            complexAim.bulletSpeed,
+            complexAim.bulletDropEnabled and "ON" or "OFF",
+            complexAim.bulletDropScale
+        )
+        return
+    end
+
+    camera = workspace.CurrentCamera
+    local origin = camera and camera.CFrame.Position
+    if not origin then
+        predictionAnalysis = "Camera unavailable."
+        return
+    end
+
+    local distance = (part.Position - origin).Magnitude
+    local root = getRootPart(getCharacter(player))
+    local velocity = root and root.AssemblyLinearVelocity or Vector3.zero
+    local targetSpeed = velocity.Magnitude
+    local travelTime = distance / math.max(complexAim.bulletSpeed, 1)
+    local leadStuds = targetSpeed * travelTime * complexAim.predictionStrength
+    local dropCompensation = complexAim.bulletDropEnabled
+        and (0.5 * workspace.Gravity * travelTime * travelTime * complexAim.bulletDropScale)
+        or 0
+
+    predictionAnalysis = string.format(
+        "%s | Dist %.0f | Speed %.0f | Travel %.2fs | Lead %.1f | Up %.1f",
+        player.Name,
+        distance,
+        targetSpeed,
+        travelTime,
+        leadStuds,
+        dropCompensation
+    )
+end
+
+local function updateComplexAim()
+    if not complexAim.enabled then
+        return
+    end
+
+    camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local _, part = getCurrentComplexTarget()
+    if not part then
+        return
+    end
+
+    local predictedPosition = getPredictedComplexPosition(part)
+    local desiredCFrame = CFrame.lookAt(camera.CFrame.Position, predictedPosition)
+    camera.CFrame = camera.CFrame:Lerp(desiredCFrame, math.clamp(complexAim.sensitivity, 0.01, 1))
+end
+
 local function destroyTool()
     if isDestroyed then
         return
@@ -1218,6 +1748,8 @@ local function destroyTool()
 
     isDestroyed = true
     settings.enabled = false
+    complexAim.enabled = false
+    complexLockedTarget = nil
     settings.espCharm = false
     settings.espBox = false
     settings.espHealth = false
@@ -1278,30 +1810,40 @@ local function createUi()
     Chillys = libraryOrError
 
     local window = Chillys.CreateLib("Chilly's Dev Tool", "Chilly")
-    local aimTab = window:NewTab("Aim")
+    local aimTab = window:NewTab("Simple Aim")
+    local complexAimTab = window:NewTab("Complex Aim")
     local visualTab = window:NewTab("Visual")
     local movementTab = window:NewTab("Movement")
     local teleportTab = window:NewTab("Teleport")
+    local saveLocationTab = window:NewTab("Save Location")
     local systemTab = window:NewTab("System")
 
-    local aimSection = aimTab:NewSection("Aim Assist")
-    local aimSettingsSection = aimTab:NewSection("Aim Settings")
+    local aimSection = aimTab:NewSection("Simple Aim")
+    local aimSettingsSection = aimTab:NewSection("Simple Aim Settings")
+    local complexAimSection = complexAimTab:NewSection("Complex Aim")
+    local complexPredictionSection = complexAimTab:NewSection("Prediction")
     local visualSection = visualTab:NewSection("ESP")
     local hitboxSection = visualTab:NewSection("Hitbox Debug")
     local movementSection = movementTab:NewSection("Character")
     local teleportSection = teleportTab:NewSection("Player Teleport")
+    local saveLocationSection = saveLocationTab:NewSection("Saved Locations")
+    local manualLocationSection = saveLocationTab:NewSection("Manual Coordinate")
     local systemSection = systemTab:NewSection("Tool")
 
     local ui = {}
     local isRefreshingUi = false
 
-    ui.status = aimSection:NewLabel("Status: loading...")
-    ui.aimToggle = aimSection:NewToggle("Aim Lock", "Enable or disable aim lock.", function(value)
+    ui.status = aimSection:NewLabel("Simple Aim: loading...")
+    ui.aimToggle = aimSection:NewToggle("Simple Aim", "Enable or disable the simple aim system.", function(value)
         if isRefreshingUi or isDestroyed then
             return
         end
 
         settings.enabled = value
+        if value then
+            complexAim.enabled = false
+            complexLockedTarget = nil
+        end
         if settings.enabled and not currentTarget then
             setCurrentTarget(getBestTarget())
         elseif not settings.enabled then
@@ -1391,6 +1933,146 @@ local function createUi()
             return
         end
         settings.smoothness = value / 100
+    end)
+
+    ui.complexStatus = complexAimSection:NewLabel("Complex Target: None")
+    ui.complexEnabled = complexAimSection:NewToggle("Complex Aim", "Enable predictive camera aim.", function(value)
+        if isRefreshingUi or isDestroyed then
+            return
+        end
+
+        complexAim.enabled = value
+        complexLockedTarget = nil
+
+        if value then
+            settings.enabled = false
+            setCurrentTarget(nil)
+        end
+
+        refreshUi()
+    end)
+
+    ui.complexTargetLock = complexAimSection:NewToggle("Target Lock", "Keep the selected target until it becomes invalid.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.targetLock = value
+        complexLockedTarget = nil
+    end)
+
+    complexAimSection:NewButton("Switch Target", "Cycle targets currently inside the Complex Aim FOV.", function()
+        switchComplexTarget()
+        refreshUi()
+    end)
+
+    ui.complexTeamCheck = complexAimSection:NewToggle("Team Check", "Ignore players detected as teammates.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.teamCheck = value
+        complexLockedTarget = nil
+    end)
+
+    ui.complexWallCheck = complexAimSection:NewToggle("Wall Check", "Require a clear raycast to the target.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.wallCheck = value
+        complexLockedTarget = nil
+    end)
+
+    ui.complexAimPart = complexAimSection:NewButton("", "Switch Complex Aim between head and body.", function()
+        complexAim.aimPart = complexAim.aimPart == "Head" and "Body" or "Head"
+        complexLockedTarget = nil
+        refreshUi()
+    end)
+
+    ui.complexFov = complexAimSection:NewSlider("Aim FOV", "Maximum screen radius for target selection.", 500, 30, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.fov = value
+    end)
+
+    ui.complexSensitivity = complexAimSection:NewSlider("Sensitivity", "Camera interpolation strength.", 100, 1, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.sensitivity = math.clamp(value / 100, 0.01, 1)
+    end)
+
+    ui.complexMaxDistance = complexAimSection:NewSlider("Max Distance", "Maximum target distance in studs.", 2000, 50, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.maxDistance = value
+        if complexLockedTarget and not isValidComplexTarget(complexLockedTarget) then
+            complexLockedTarget = nil
+        end
+    end)
+
+    ui.complexPrediction = complexPredictionSection:NewToggle("Prediction", "Lead targets using velocity and travel time.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.predictionEnabled = value
+    end)
+
+    ui.predictionStrength = complexPredictionSection:NewSlider("Prediction Strength", "Scale the target velocity lead.", 200, 0, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.predictionStrength = value / 100
+    end)
+
+    ui.bulletSpeed = complexPredictionSection:NewSlider("Bullet Speed", "Projectile speed used for prediction.", 20000, 100, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.bulletSpeed = value
+    end)
+
+    ui.bulletDrop = complexPredictionSection:NewToggle("Bullet Drop", "Compensate upward for projectile gravity.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.bulletDropEnabled = value
+    end)
+
+    ui.bulletDropScale = complexPredictionSection:NewSlider("Bullet Drop Scale", "Scale gravity compensation.", 500, 0, function(value)
+        if isRefreshingUi then
+            return
+        end
+        complexAim.bulletDropScale = value / 100
+    end)
+
+    ui.autoDetectBallistics = complexPredictionSection:NewToggle(
+        "Auto Detect Ballistics",
+        "Scan equipped Tool attributes and numeric values for projectile speed/drop.",
+        function(value)
+            if isRefreshingUi then
+                return
+            end
+
+            complexAim.autoDetectBallistics = value
+            if value then
+                autoDetectBallistics(true)
+            end
+            refreshUi()
+        end
+    )
+
+    ui.ballisticsInfo = complexPredictionSection:NewLabel("Ballistics: Manual/default")
+    ui.predictionInfo = complexPredictionSection:NewLabel("Prediction: No check yet")
+
+    complexPredictionSection:NewButton("Refresh Ballistics", "Rescan the equipped Tool for speed and drop values.", function()
+        autoDetectBallistics(true)
+        refreshUi()
+    end)
+
+    complexPredictionSection:NewButton("Check Best Prediction", "Enable prediction, reset strength to 100%, and calculate lead/drop preview.", function()
+        analyzePredictionSettings()
+        refreshUi()
     end)
 
     ui.espCharm = visualSection:NewToggle("ESP Highlight", "Show a highlight on valid players.", function(value)
@@ -1515,6 +2197,81 @@ local function createUi()
         refreshUi()
     end)
 
+    ui.currentCoordinate = saveLocationSection:NewLabel("Current: unavailable")
+    ui.saveLocationName = saveLocationSection:NewTextBox("Location Name", "Type a name and press Enter.", function(text)
+        local cleanedName = tostring(text or ""):match("^%s*(.-)%s*$")
+        if cleanedName ~= "" then
+            saveLocationName = cleanedName
+        end
+        refreshUi()
+    end)
+    ui.saveLocationName:UpdatePlaceholder("Location")
+
+    saveLocationSection:NewButton("Get Coordinate", "Read and copy your current X, Y, Z coordinate.", function()
+        local coordinate = getCoordinateString()
+        if not coordinate then
+            return
+        end
+
+        manualCoordinateText = coordinate
+        ui.manualCoordinate:UpdateText(coordinate)
+        if typeof(setclipboard) == "function" then
+            pcall(setclipboard, coordinate)
+        end
+        refreshUi()
+    end)
+
+    saveLocationSection:NewButton("Save Location", "Save the current CFrame using the entered name.", function()
+        local root = getLocalRootPart()
+        if not root then
+            return
+        end
+
+        local name = saveLocationName
+        if name == "" then
+            name = "Location " .. tostring(os.time())
+        end
+
+        savedLocations[name] = root.CFrame
+        selectedSavedLocation = name
+        refreshUi()
+    end)
+
+    ui.savedLocation = saveLocationSection:NewButton("", "Cycle through saved locations.", function()
+        cycleSavedLocation()
+        refreshUi()
+    end)
+
+    saveLocationSection:NewButton("Teleport to Saved Location", "Teleport to the selected saved location.", function()
+        local targetCFrame = selectedSavedLocation and savedLocations[selectedSavedLocation]
+        if targetCFrame then
+            teleportToCFrame(targetCFrame)
+        end
+        refreshUi()
+    end)
+
+    saveLocationSection:NewButton("Delete Saved Location", "Delete the currently selected location.", function()
+        if selectedSavedLocation then
+            savedLocations[selectedSavedLocation] = nil
+            selectedSavedLocation = nil
+            cycleSavedLocation()
+        end
+        refreshUi()
+    end)
+
+    ui.manualCoordinate = manualLocationSection:NewTextBox("Coordinate", "Use X, Y, Z and press Enter.", function(text)
+        manualCoordinateText = tostring(text or "")
+    end)
+    ui.manualCoordinate:UpdatePlaceholder("0, 10, 0")
+
+    manualLocationSection:NewButton("Teleport to Coordinate", "Teleport to the entered X, Y, Z coordinate.", function()
+        local position = parseVector3(manualCoordinateText)
+        if position then
+            teleportToCFrame(CFrame.new(position))
+        end
+        refreshUi()
+    end)
+
     systemSection:NewLabel("Chilly's Dev Tool - own-experience testing")
     systemSection:NewButton("Destroy Tool", "Disable features, clean overlays, and remove the UI.", function()
         destroyTool()
@@ -1531,8 +2288,12 @@ local function createUi()
         local selectedPlayer = ensureSelectedTeleportPlayer()
         local selectedName = selectedPlayer and selectedPlayer.Name or "No players"
 
-        ui.status:UpdateLabel(getTeamModeLabel() .. " | Target: " .. targetName)
-        ui.aimToggle:UpdateToggle("Aim Lock", settings.enabled)
+        local complexTargetName = complexLockedTarget and complexLockedTarget.Name or "None"
+        local coordinate = getCoordinateString() or "unavailable"
+        local savedName = selectedSavedLocation or "None"
+
+        ui.status:UpdateLabel("Simple Aim | " .. getTeamModeLabel() .. " | Target: " .. targetName)
+        ui.aimToggle:UpdateToggle("Simple Aim", settings.enabled)
         ui.wallCheck:UpdateToggle("Wall Check", settings.wallCheck)
         ui.retarget:UpdateToggle("Retarget Every Frame", settings.retargetEveryFrame)
         ui.aimPart:UpdateButton("Aim Part: " .. settings.aimPart)
@@ -1542,6 +2303,31 @@ local function createUi()
         ui.switchKey:UpdateButton("Switch Key: " .. settings.targetSwitchKey.Name)
         ui.fov:UpdateSlider(settings.fovRadius)
         ui.smoothness:UpdateSlider(math.floor(settings.smoothness * 100))
+
+        ui.complexStatus:UpdateLabel("Complex Target: " .. complexTargetName)
+        ui.complexEnabled:UpdateToggle("Complex Aim", complexAim.enabled)
+        ui.complexTargetLock:UpdateToggle("Target Lock", complexAim.targetLock)
+        ui.complexTeamCheck:UpdateToggle("Team Check", complexAim.teamCheck)
+        ui.complexWallCheck:UpdateToggle("Wall Check", complexAim.wallCheck)
+        ui.complexAimPart:UpdateButton("Aim Location: " .. complexAim.aimPart)
+        ui.complexFov:UpdateSlider(complexAim.fov)
+        ui.complexSensitivity:UpdateSlider(math.floor(complexAim.sensitivity * 100))
+        ui.complexMaxDistance:UpdateSlider(complexAim.maxDistance)
+        ui.complexPrediction:UpdateToggle("Prediction", complexAim.predictionEnabled)
+        ui.predictionStrength:UpdateSlider(math.floor(complexAim.predictionStrength * 100))
+        ui.bulletSpeed:UpdateSlider(complexAim.bulletSpeed)
+        ui.bulletDrop:UpdateToggle("Bullet Drop", complexAim.bulletDropEnabled)
+        ui.bulletDropScale:UpdateSlider(math.floor(complexAim.bulletDropScale * 100))
+        ui.autoDetectBallistics:UpdateToggle("Auto Detect Ballistics", complexAim.autoDetectBallistics)
+        ui.ballisticsInfo:UpdateLabel(string.format(
+            "Ballistics | %s | Speed %.0f | Drop %s %.2f | Data %d",
+            detectedBallistics.weapon or "None",
+            complexAim.bulletSpeed,
+            complexAim.bulletDropEnabled and "ON" or "OFF",
+            complexAim.bulletDropScale,
+            detectedBallistics.found or 0
+        ))
+        ui.predictionInfo:UpdateLabel("Prediction | " .. predictionAnalysis)
 
         ui.espCharm:UpdateToggle("ESP Highlight", settings.espCharm)
         ui.espBox:UpdateToggle("ESP Box", settings.espBox)
@@ -1558,10 +2344,13 @@ local function createUi()
         ui.jumpPower:UpdateSlider(settings.jumpPower)
         ui.flySpeed:UpdateSlider(settings.flySpeed)
         ui.teleportTarget:UpdateButton("Target: " .. selectedName)
+        ui.currentCoordinate:UpdateLabel("Current: " .. coordinate)
+        ui.savedLocation:UpdateButton("Saved Location: " .. savedName)
 
         isRefreshingUi = false
     end
 
+    autoDetectBallistics(true)
     refreshUi()
 end
 trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
@@ -1578,11 +2367,23 @@ trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcesse
         return
     end
 
+    if input.KeyCode == Enum.KeyCode.T and complexAim.enabled then
+        switchComplexTarget()
+        if refreshUi then
+            refreshUi()
+        end
+        return
+    end
+
     if input.KeyCode == settings.aimToggleKey then
         settings.enabled = not settings.enabled
 
-        if settings.enabled and not currentTarget then
-            setCurrentTarget(getBestTarget())
+        if settings.enabled then
+            complexAim.enabled = false
+            complexLockedTarget = nil
+            if not currentTarget then
+                setCurrentTarget(getBestTarget())
+            end
         elseif not settings.enabled then
             setCurrentTarget(nil)
         end
@@ -1627,6 +2428,10 @@ trackConnection(Players.PlayerRemoving:Connect(function(player)
 
     if currentTarget == player then
         setCurrentTarget(nil)
+    end
+
+    if complexLockedTarget == player then
+        complexLockedTarget = nil
     end
 
     if selectedTeleportPlayer == player then
@@ -1695,6 +2500,8 @@ RunService:BindToRenderStep(renderStepName, Enum.RenderPriority.Camera.Value + 1
     applyMovementSettings()
     applyNoclip()
     applyFly(deltaTime)
+    autoDetectBallistics(false)
+    updateComplexAim()
 
     if not camera or not settings.enabled then
         return
@@ -1724,4 +2531,3 @@ end)
 
 captureBaseMovementSettings(true)
 createUi()
-
