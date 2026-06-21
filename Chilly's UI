@@ -17,6 +17,8 @@ local Objects = {}
 
 local activeGui
 local activeTheme
+local toggleUiConnection
+local toggleUiKey = Enum.KeyCode.Insert
 
 local function resolveGuiParent()
     if typeof(gethui) == "function" then
@@ -221,6 +223,11 @@ function Chillys:ToggleUI()
 end
 
 function Chillys:Destroy()
+    if toggleUiConnection then
+        toggleUiConnection:Disconnect()
+        toggleUiConnection = nil
+    end
+
     if activeGui then
         activeGui:Destroy()
         activeGui = nil
@@ -2814,14 +2821,16 @@ function Chillys:Start()
     local homeSection = homeTab:NewSection("Chilly's UI")
 
     homeSection:NewLabel("Chilly's UI berhasil dimuat.")
-    homeSection:NewKeybind(
-        "Tampilkan / Sembunyikan GUI",
-        "Tekan RightControl untuk membuka atau menyembunyikan GUI.",
-        Enum.KeyCode.RightControl,
-        function()
+
+    if toggleUiConnection then
+        toggleUiConnection:Disconnect()
+    end
+
+    toggleUiConnection = UserInputService.InputBegan:Connect(function(inputObject, gameProcessed)
+        if not gameProcessed and inputObject.KeyCode == toggleUiKey then
             Chillys:ToggleUI()
         end
-    )
+    end)
 
     return activeGui
 end
