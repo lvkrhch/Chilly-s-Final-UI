@@ -1,1 +1,1727 @@
+--[[
+    Chilly's Roblox Studio Dev Tool
+
+    Put this LocalScript in:
+    StarterPlayer > StarterPlayerScripts
+
+    Default controls:
+    - E: Toggle aim lock
+    - Q: Switch/cycle target
+    - Insert: Show/hide menu
+
+    Notes:
+    - Intended for your own Roblox experience while testing in Studio.
+    - Do not use this to cheat in experiences you do not own.
+    - Hitbox expander here is a low-opacity client debug helper. For real
+      server-authoritative damage in your own game, wire your weapon code to
+      validate hits on the server.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local localPlayer = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+
+local settings = {
+    enabled = false,
+    wallCheck = true,
+    espCharm = false,
+    espBox = false,
+    espHealth = false,
+    hitboxExpander = false,
+    flyEnabled = false,
+    noclipEnabled = false,
+    infiniteJumpEnabled = false,
+
+    aimPart = "Head", -- "Head" or "Body"
+    targetMode = "Distance", -- "FOV" or "Distance"
+    teamMode = "Auto", -- "Auto", "FFA", or "Team"
+    fovRadius = 180,
+    smoothness = 0.86, -- closer to 1 = smoother/slower
+    retargetEveryFrame = false,
+
+    aimToggleKey = Enum.KeyCode.E,
+    targetSwitchKey = Enum.KeyCode.Q,
+    menuKey = Enum.KeyCode.Insert,
+
+    walkSpeed = 16,
+    jumpPower = 50,
+    jumpHeight = 7.2,
+    useJumpPower = true,
+    flySpeed = 54,
+    hitboxSize = 8,
+    hitboxShape = "Box", -- "Box" or "Ball"
+    hitboxTargetMode = "Enemies", -- "Enemies", "Target", or "All"
+    hitboxTransparency = 0.94,
+
+    minWalkSpeed = 8,
+    maxWalkSpeed = 80,
+    minJumpPower = 25,
+    maxJumpPower = 150,
+    minFlySpeed = 20,
+    maxFlySpeed = 160,
+    minHitboxSize = 4,
+    maxHitboxSize = 30,
+
+    walkSpeedStep = 4,
+    jumpPowerStep = 10,
+    flySpeedStep = 8,
+    hitboxSizeStep = 1,
+}
+
+local keyChoices = {
+    Enum.KeyCode.Q,
+    Enum.KeyCode.E,
+    Enum.KeyCode.R,
+    Enum.KeyCode.T,
+    Enum.KeyCode.F,
+    Enum.KeyCode.G,
+    Enum.KeyCode.X,
+    Enum.KeyCode.C,
+    Enum.KeyCode.V,
+    Enum.KeyCode.LeftAlt,
+}
+
+local currentTarget = nil
+local selectedTeleportPlayer = nil
+local Chillys = nil
+local targetDiedConnection = nil
+local targetCharacterRemovingConnection = nil
+local espHighlights = {}
+local espBoxes = {}
+local espBillboards = {}
+local hitboxParts = {}
+local originalCollisions = {}
+local baseMovementSettings = nil
+local refreshUi = nil
+local isDestroyed = false
+local connections = {}
+local playerCharacterConnections = {}
+local renderStepName = "ChillysDevTool"
+
+local function trackConnection(connection)
+    table.insert(connections, connection)
+    return connection
+end
+
+local customTeamAttributes = {
+    "Team",
+    "TeamId",
+    "TeamName",
+    "Faction",
+    "Side",
+    "Squad",
+    "Group",
+    "Clan",
+}
+
+local function getCharacter(player)
+    return player and player.Character or nil
+end
+
+local function getHumanoid(character)
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRootPart(character)
+    if not character then
+        return nil
+    end
+
+    return character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+end
+
+local function getAimPart(character)
+    if not character then
+        return nil
+    end
+
+    if settings.aimPart == "Head" then
+        return character:FindFirstChild("Head")
+    end
+
+    return character:FindFirstChild("UpperTorso")
+        or character:FindFirstChild("Torso")
+        or character:FindFirstChild("HumanoidRootPart")
+        or character:FindFirstChild("Head")
+end
+
+local function getLocalHumanoid()
+    return getHumanoid(getCharacter(localPlayer))
+end
+
+local function getLocalRootPart()
+    return getRootPart(getCharacter(localPlayer))
+end
+
+local function addTeamToken(tokens, sourceName, value)
+    if value == nil then
+        return
+    end
+
+    local text = tostring(value)
+    if text == "" then
+        return
+    end
+
+    tokens[sourceName .. ":" .. text] = true
+end
+
+local function tokenHasPrefix(token, prefix)
+    return string.sub(token, 1, #prefix) == prefix
+end
+
+local function isIgnoredTeamText(value)
+    local text = string.lower(tostring(value or ""))
+
+    return text == ""
+        or text == "none"
+        or text == "nil"
+        or text == "neutral"
+        or text == "ffa"
+        or text == "freeforall"
+        or text == "free for all"
+        or text == "all"
+        or text == "everyone"
+        or text == "default"
+        or text == "game"
+        or text == "ingame"
+        or text == "in game"
+        or text == "in-game"
+        or text == "no team"
+        or text == "noteam"
+        or text == "playing"
+        or text == "player"
+        or text == "players"
+        or text == "lobby"
+        or text == "spectator"
+        or text == "spectators"
+end
+
+local function readTeamValueObject(parent, tokens)
+    if not parent then
+        return
+    end
+
+    for _, name in ipairs(customTeamAttributes) do
+        local child = parent:FindFirstChild(name)
+
+        if child and child:IsA("ValueBase") then
+            if not isIgnoredTeamText(child.Value) then
+                addTeamToken(tokens, "Value:" .. name, child.Value)
+            end
+        end
+    end
+end
+
+local function getTeamTokens(player)
+    local tokens = {}
+    local character = getCharacter(player)
+
+    if player.Team and not player.Neutral and not isIgnoredTeamText(player.Team.Name) then
+        addTeamToken(tokens, "Team", player.Team.Name)
+        if player.TeamColor and not isIgnoredTeamText(player.TeamColor.Name) then
+            addTeamToken(tokens, "TeamColor", player.TeamColor.Name)
+        end
+    end
+
+    for _, attributeName in ipairs(customTeamAttributes) do
+        local playerValue = player:GetAttribute(attributeName)
+        if not isIgnoredTeamText(playerValue) then
+            addTeamToken(tokens, "Attribute:" .. attributeName, playerValue)
+        end
+
+        if character then
+            local characterValue = character:GetAttribute(attributeName)
+            if not isIgnoredTeamText(characterValue) then
+                addTeamToken(tokens, "CharacterAttribute:" .. attributeName, characterValue)
+            end
+        end
+    end
+
+    readTeamValueObject(player, tokens)
+    readTeamValueObject(character, tokens)
+
+    return tokens
+end
+
+local function hasAnyToken(tokens)
+    return next(tokens) ~= nil
+end
+
+local function hasRobloxTeamToken(tokens)
+    for token in pairs(tokens) do
+        if tokenHasPrefix(token, "Team:") then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function hasSharedCustomTeamToken(tokens, tokenPlayerCounts)
+    for token in pairs(tokens) do
+        if not tokenHasPrefix(token, "Team:")
+            and not tokenHasPrefix(token, "TeamColor:")
+            and (tokenPlayerCounts[token] or 0) >= 2 then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function teamTokensOverlap(firstTokens, secondTokens)
+    for token in pairs(firstTokens) do
+        if secondTokens[token] then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function hasMatchingTeam(player)
+    local myTokens = getTeamTokens(localPlayer)
+    local theirTokens = getTeamTokens(player)
+
+    if not hasAnyToken(myTokens) or not hasAnyToken(theirTokens) then
+        return false
+    end
+
+    for token in pairs(myTokens) do
+        if theirTokens[token] then
+            return true
+        end
+    end
+
+    return false
+end
+
+local function detectTeamMatch()
+    local teamGroups = {}
+    local tokenPlayerCounts = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local tokens = getTeamTokens(player)
+
+        if hasAnyToken(tokens) then
+            for token in pairs(tokens) do
+                tokenPlayerCounts[token] = (tokenPlayerCounts[token] or 0) + 1
+            end
+        end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        local tokens = getTeamTokens(player)
+
+        if hasAnyToken(tokens)
+            and (hasRobloxTeamToken(tokens) or hasSharedCustomTeamToken(tokens, tokenPlayerCounts)) then
+            local matchedGroup = nil
+
+            for _, group in ipairs(teamGroups) do
+                if teamTokensOverlap(tokens, group.tokens) then
+                    matchedGroup = group
+                    break
+                end
+            end
+
+            if not matchedGroup then
+                matchedGroup = {
+                    tokens = {},
+                    players = 0,
+                }
+                table.insert(teamGroups, matchedGroup)
+            end
+
+            matchedGroup.players = matchedGroup.players + 1
+            for token in pairs(tokens) do
+                matchedGroup.tokens[token] = true
+            end
+        end
+    end
+
+    return #teamGroups >= 2
+end
+
+local function isTeamMatch()
+    if settings.teamMode == "FFA" then
+        return false
+    end
+
+    if settings.teamMode == "Team" then
+        return true
+    end
+
+    return detectTeamMatch()
+end
+
+local function getTeamModeLabel()
+    if settings.teamMode == "Auto" then
+        return detectTeamMatch() and "Auto Team" or "Auto FFA"
+    end
+
+    return settings.teamMode
+end
+
+local function isSameTeam(player)
+    if not isTeamMatch() then
+        return false
+    end
+
+    return hasMatchingTeam(player)
+end
+
+local function hasLineOfSight(targetCharacter, targetPart)
+    if not settings.wallCheck then
+        return true
+    end
+
+    camera = workspace.CurrentCamera
+    if not camera or not targetPart then
+        return false
+    end
+
+    local origin = camera.CFrame.Position
+    local direction = targetPart.Position - origin
+
+    local raycastParams = RaycastParams.new()
+    raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+    raycastParams.FilterDescendantsInstances = {getCharacter(localPlayer)}
+    raycastParams.IgnoreWater = true
+
+    local result = workspace:Raycast(origin, direction, raycastParams)
+
+    if not result then
+        return true
+    end
+
+    return result.Instance:IsDescendantOf(targetCharacter)
+end
+
+local function isAlive(player)
+    local character = getCharacter(player)
+    local humanoid = getHumanoid(character)
+
+    return character ~= nil
+        and humanoid ~= nil
+        and humanoid.Health > 0
+        and humanoid:GetState() ~= Enum.HumanoidStateType.Dead
+end
+
+local function isValidTarget(player)
+    if player == localPlayer then
+        return false
+    end
+
+    if isSameTeam(player) then
+        return false
+    end
+
+    local character = getCharacter(player)
+    local aimPart = getAimPart(character)
+
+    if not isAlive(player) or not aimPart then
+        return false
+    end
+
+    return hasLineOfSight(character, aimPart)
+end
+
+local function disconnectTargetSignals()
+    if targetDiedConnection then
+        targetDiedConnection:Disconnect()
+        targetDiedConnection = nil
+    end
+
+    if targetCharacterRemovingConnection then
+        targetCharacterRemovingConnection:Disconnect()
+        targetCharacterRemovingConnection = nil
+    end
+end
+
+local function setCurrentTarget(player)
+    if currentTarget == player then
+        return
+    end
+
+    disconnectTargetSignals()
+    currentTarget = player
+
+    if not currentTarget then
+        if refreshUi then
+            refreshUi()
+        end
+        return
+    end
+
+    local character = getCharacter(currentTarget)
+    local humanoid = getHumanoid(character)
+
+    if humanoid then
+        targetDiedConnection = humanoid.Died:Connect(function()
+            setCurrentTarget(nil)
+        end)
+    end
+
+    targetCharacterRemovingConnection = currentTarget.CharacterRemoving:Connect(function()
+        setCurrentTarget(nil)
+    end)
+
+    if refreshUi then
+        refreshUi()
+    end
+end
+
+local function getScreenDistanceFromCenter(worldPosition)
+    camera = workspace.CurrentCamera
+    if not camera then
+        return math.huge
+    end
+
+    local viewportPoint, onScreen = camera:WorldToViewportPoint(worldPosition)
+    if not onScreen or viewportPoint.Z <= 0 then
+        return math.huge
+    end
+
+    local viewportSize = camera.ViewportSize
+    local screenCenter = Vector2.new(viewportSize.X / 2, viewportSize.Y / 2)
+    local point = Vector2.new(viewportPoint.X, viewportPoint.Y)
+
+    return (point - screenCenter).Magnitude
+end
+
+local function getWorldDistanceFromLocalPlayer(worldPosition)
+    local root = getLocalRootPart()
+    if not root then
+        return math.huge
+    end
+
+    return (root.Position - worldPosition).Magnitude
+end
+
+local function getTargetScore(player)
+    local character = getCharacter(player)
+    local aimPart = getAimPart(character)
+
+    if not aimPart then
+        return math.huge
+    end
+
+    if settings.targetMode == "Distance" then
+        return getWorldDistanceFromLocalPlayer(aimPart.Position)
+    end
+
+    local screenDistance = getScreenDistanceFromCenter(aimPart.Position)
+    if screenDistance > settings.fovRadius then
+        return math.huge
+    end
+
+    return screenDistance
+end
+
+local function getSortedTargets()
+    local targets = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidTarget(player) then
+            local score = getTargetScore(player)
+
+            if score < math.huge then
+                table.insert(targets, {
+                    player = player,
+                    score = score,
+                })
+            end
+        end
+    end
+
+    table.sort(targets, function(a, b)
+        return a.score < b.score
+    end)
+
+    return targets
+end
+
+local function getBestTarget()
+    local targets = getSortedTargets()
+    return targets[1] and targets[1].player or nil
+end
+
+local function cycleTarget()
+    local targets = getSortedTargets()
+
+    if #targets == 0 then
+        setCurrentTarget(nil)
+        return
+    end
+
+    if not settings.enabled then
+        settings.enabled = true
+    end
+
+    local currentIndex = nil
+    for index, entry in ipairs(targets) do
+        if entry.player == currentTarget then
+            currentIndex = index
+            break
+        end
+    end
+
+    local nextIndex = currentIndex and currentIndex + 1 or 1
+    if nextIndex > #targets then
+        nextIndex = 1
+    end
+
+    setCurrentTarget(targets[nextIndex].player)
+end
+
+local function aimAt(targetPart, deltaTime)
+    camera = workspace.CurrentCamera
+
+    if not camera or not targetPart then
+        return
+    end
+
+    local cameraPosition = camera.CFrame.Position
+    local targetCFrame = CFrame.lookAt(cameraPosition, targetPart.Position)
+    local frameScale = math.max(deltaTime or 1 / 60, 1 / 240) * 60
+    local alpha = 1 - math.pow(math.clamp(settings.smoothness, 0.05, 0.98), frameScale)
+
+    camera.CFrame = camera.CFrame:Lerp(targetCFrame, math.clamp(alpha, 0.02, 0.95))
+end
+
+local function captureBaseMovementSettings(force)
+    local humanoid = getLocalHumanoid()
+    if not humanoid then
+        return
+    end
+
+    if baseMovementSettings and not force then
+        return
+    end
+
+    local useJumpPower = true
+    pcall(function()
+        useJumpPower = humanoid.UseJumpPower
+    end)
+
+    baseMovementSettings = {
+        walkSpeed = humanoid.WalkSpeed,
+        jumpPower = humanoid.JumpPower,
+        jumpHeight = humanoid.JumpHeight,
+        useJumpPower = useJumpPower,
+    }
+
+    settings.walkSpeed = baseMovementSettings.walkSpeed
+    settings.jumpPower = baseMovementSettings.jumpPower
+    settings.jumpHeight = baseMovementSettings.jumpHeight
+    settings.useJumpPower = baseMovementSettings.useJumpPower
+    settings.maxWalkSpeed = math.max(settings.maxWalkSpeed, baseMovementSettings.walkSpeed * 3)
+    settings.maxJumpPower = math.max(settings.maxJumpPower, baseMovementSettings.jumpPower * 3)
+end
+
+local function applyMovementSettings()
+    local humanoid = getLocalHumanoid()
+    if not humanoid then
+        return
+    end
+
+    captureBaseMovementSettings(false)
+    humanoid.WalkSpeed = settings.walkSpeed
+
+    pcall(function()
+        humanoid.UseJumpPower = settings.useJumpPower
+    end)
+
+    if settings.useJumpPower then
+        humanoid.JumpPower = settings.jumpPower
+    else
+        humanoid.JumpHeight = settings.jumpHeight
+    end
+end
+
+local function adjustWalkSpeed(amount)
+    settings.walkSpeed = math.clamp(
+        settings.walkSpeed + amount,
+        settings.minWalkSpeed,
+        settings.maxWalkSpeed
+    )
+
+    applyMovementSettings()
+end
+
+local function adjustJumpPower(amount)
+    if settings.useJumpPower then
+        settings.jumpPower = math.clamp(
+            settings.jumpPower + amount,
+            settings.minJumpPower,
+            settings.maxJumpPower
+        )
+    else
+        settings.jumpHeight = math.clamp(
+            settings.jumpHeight + amount / 10,
+            3,
+            25
+        )
+    end
+
+    applyMovementSettings()
+end
+
+local function resetMovementToGameDefaults()
+    captureBaseMovementSettings(false)
+
+    if not baseMovementSettings then
+        return
+    end
+
+    settings.walkSpeed = baseMovementSettings.walkSpeed
+    settings.jumpPower = baseMovementSettings.jumpPower
+    settings.jumpHeight = baseMovementSettings.jumpHeight
+    settings.useJumpPower = baseMovementSettings.useJumpPower
+    applyMovementSettings()
+end
+
+local function adjustFlySpeed(amount)
+    settings.flySpeed = math.clamp(
+        settings.flySpeed + amount,
+        settings.minFlySpeed,
+        settings.maxFlySpeed
+    )
+end
+
+local function adjustHitboxSize(amount)
+    settings.hitboxSize = math.clamp(
+        settings.hitboxSize + amount,
+        settings.minHitboxSize,
+        settings.maxHitboxSize
+    )
+end
+
+local function cycleHitboxShape()
+    settings.hitboxShape = settings.hitboxShape == "Box" and "Ball" or "Box"
+end
+
+local function cycleHitboxTargetMode()
+    if settings.hitboxTargetMode == "Enemies" then
+        settings.hitboxTargetMode = "Target"
+    elseif settings.hitboxTargetMode == "Target" then
+        settings.hitboxTargetMode = "All"
+    else
+        settings.hitboxTargetMode = "Enemies"
+    end
+
+end
+
+local function cycleTeamMode()
+    if settings.teamMode == "Auto" then
+        settings.teamMode = "FFA"
+    elseif settings.teamMode == "FFA" then
+        settings.teamMode = "Team"
+    else
+        settings.teamMode = "Auto"
+    end
+end
+
+local function getNextKey(currentKey)
+    local currentIndex = table.find(keyChoices, currentKey) or 1
+    local nextIndex = currentIndex + 1
+
+    if nextIndex > #keyChoices then
+        nextIndex = 1
+    end
+
+    return keyChoices[nextIndex]
+end
+
+local function destroyEsp(player)
+    local highlight = espHighlights[player]
+    if highlight then
+        highlight:Destroy()
+        espHighlights[player] = nil
+    end
+
+    local box = espBoxes[player]
+    if box then
+        box:Destroy()
+        espBoxes[player] = nil
+    end
+
+    local billboard = espBillboards[player]
+    if billboard then
+        billboard:Destroy()
+        espBillboards[player] = nil
+    end
+end
+
+local function shouldShowEsp(player)
+    if player == localPlayer then
+        return false
+    end
+
+    if not settings.espCharm and not settings.espBox and not settings.espHealth then
+        return false
+    end
+
+    return isAlive(player)
+end
+
+local function updateEspForPlayer(player)
+    if not shouldShowEsp(player) then
+        destroyEsp(player)
+        return
+    end
+
+    local character = getCharacter(player)
+    local humanoid = getHumanoid(character)
+    local root = getRootPart(character)
+
+    if not character or not humanoid or not root then
+        destroyEsp(player)
+        return
+    end
+
+    local isFriendly = isTeamMatch() and hasMatchingTeam(player)
+    local mainColor = isFriendly and Color3.fromRGB(55, 145, 255) or Color3.fromRGB(255, 75, 60)
+    local accentColor = isFriendly and Color3.fromRGB(175, 220, 255) or Color3.fromRGB(255, 220, 120)
+
+    if settings.espCharm then
+        local highlight = espHighlights[player]
+
+        if not highlight or highlight.Parent ~= character then
+            if highlight then
+                highlight:Destroy()
+            end
+
+            highlight = Instance.new("Highlight")
+            highlight.Name = "ChillyEspCharm"
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.FillTransparency = 0.6
+            highlight.OutlineTransparency = 0.15
+            highlight.Adornee = character
+            highlight.Parent = character
+
+            espHighlights[player] = highlight
+        end
+
+        highlight.FillColor = mainColor
+        highlight.OutlineColor = accentColor
+    elseif espHighlights[player] then
+        espHighlights[player]:Destroy()
+        espHighlights[player] = nil
+    end
+
+    if settings.espBox then
+        local box = espBoxes[player]
+
+        if not box or box.Parent ~= root then
+            if box then
+                box:Destroy()
+            end
+
+            box = Instance.new("BoxHandleAdornment")
+            box.Name = "ChillyEspBox"
+            box.AlwaysOnTop = true
+            box.Adornee = root
+            box.ZIndex = 4
+            box.Transparency = 0.45
+            box.Size = Vector3.new(4, 6, 2.5)
+            box.Parent = root
+
+            espBoxes[player] = box
+        end
+
+        box.Color3 = mainColor
+    elseif espBoxes[player] then
+        espBoxes[player]:Destroy()
+        espBoxes[player] = nil
+    end
+
+    if settings.espHealth then
+        local billboard = espBillboards[player]
+
+        if not billboard or billboard.Parent ~= root then
+            if billboard then
+                billboard:Destroy()
+            end
+
+            billboard = Instance.new("BillboardGui")
+            billboard.Name = "ChillyEspHealth"
+            billboard.AlwaysOnTop = true
+            billboard.Size = UDim2.fromOffset(86, 34)
+            billboard.StudsOffset = Vector3.new(0, 3.6, 0)
+            billboard.Adornee = root
+            billboard.Parent = root
+
+            local label = Instance.new("TextLabel")
+            label.Name = "NameLabel"
+            label.Size = UDim2.new(1, 0, 0, 16)
+            label.BackgroundTransparency = 1
+            label.TextColor3 = Color3.fromRGB(255, 255, 255)
+            label.TextStrokeTransparency = 0.35
+            label.Font = Enum.Font.GothamBold
+            label.TextSize = 11
+            label.Parent = billboard
+
+            local barBack = Instance.new("Frame")
+            barBack.Name = "BarBack"
+            barBack.Size = UDim2.new(1, -12, 0, 6)
+            barBack.Position = UDim2.fromOffset(6, 21)
+            barBack.BackgroundColor3 = Color3.fromRGB(35, 35, 35)
+            barBack.BorderSizePixel = 0
+            barBack.Parent = billboard
+
+            local bar = Instance.new("Frame")
+            bar.Name = "Bar"
+            bar.Size = UDim2.new(1, 0, 1, 0)
+            bar.BackgroundColor3 = Color3.fromRGB(70, 215, 105)
+            bar.BorderSizePixel = 0
+            bar.Parent = barBack
+
+            espBillboards[player] = billboard
+        end
+
+        local label = billboard:FindFirstChild("NameLabel")
+        local barBack = billboard:FindFirstChild("BarBack")
+        local bar = barBack and barBack:FindFirstChild("Bar")
+        local ratio = humanoid.MaxHealth > 0 and math.clamp(humanoid.Health / humanoid.MaxHealth, 0, 1) or 0
+
+        if label then
+            label.Text = player.Name .. " " .. tostring(math.floor(humanoid.Health))
+        end
+
+        if bar then
+            bar.Size = UDim2.new(ratio, 0, 1, 0)
+            bar.BackgroundColor3 = Color3.fromRGB(220 - 150 * ratio, 65 + 150 * ratio, 70)
+        end
+    elseif espBillboards[player] then
+        espBillboards[player]:Destroy()
+        espBillboards[player] = nil
+    end
+end
+
+local function refreshEsp()
+    for _, player in ipairs(Players:GetPlayers()) do
+        updateEspForPlayer(player)
+    end
+end
+
+local function destroyHitbox(player)
+    local part = hitboxParts[player]
+
+    if part then
+        part:Destroy()
+        hitboxParts[player] = nil
+    end
+end
+
+local function isValidHitboxTarget(player)
+    if player == localPlayer then
+        return false
+    end
+
+    if not isAlive(player) then
+        return false
+    end
+
+    if settings.hitboxTargetMode == "Enemies" or settings.hitboxTargetMode == "Target" then
+        return not isSameTeam(player)
+    end
+
+    return true
+end
+
+local function getBestHitboxTarget()
+    local bestPlayer = nil
+    local bestDistance = math.huge
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if isValidHitboxTarget(player) then
+            local root = getRootPart(getCharacter(player))
+
+            if root then
+                local distance = getWorldDistanceFromLocalPlayer(root.Position)
+
+                if distance < bestDistance then
+                    bestDistance = distance
+                    bestPlayer = player
+                end
+            end
+        end
+    end
+
+    return bestPlayer
+end
+
+local function shouldExpandHitboxForPlayer(player)
+    if not settings.hitboxExpander or not isValidHitboxTarget(player) then
+        return false
+    end
+
+    if settings.hitboxTargetMode == "Target" then
+        return player == (currentTarget or getBestHitboxTarget())
+    end
+
+    if settings.hitboxTargetMode == "Enemies" then
+        return true
+    end
+
+    return true
+end
+
+local function getHitboxSize()
+    if settings.hitboxShape == "Box" then
+        return Vector3.new(settings.hitboxSize * 0.75, settings.hitboxSize, settings.hitboxSize * 0.5)
+    end
+
+    return Vector3.new(settings.hitboxSize, settings.hitboxSize, settings.hitboxSize)
+end
+
+local function getHitboxColor(player)
+    if player == currentTarget then
+        return Color3.fromRGB(255, 215, 80)
+    end
+
+    if isSameTeam(player) then
+        return Color3.fromRGB(55, 145, 255)
+    end
+
+    return Color3.fromRGB(255, 80, 80)
+end
+
+local function updateHitboxForPlayer(player)
+    if not shouldExpandHitboxForPlayer(player) then
+        destroyHitbox(player)
+        return
+    end
+
+    local character = getCharacter(player)
+    local root = getRootPart(character)
+
+    if not character or not root then
+        destroyHitbox(player)
+        return
+    end
+
+    local hitbox = hitboxParts[player]
+    if not hitbox or hitbox.Parent ~= character then
+        destroyHitbox(player)
+
+        hitbox = Instance.new("Part")
+        hitbox.Name = "ChillyHitboxExpander"
+        hitbox.Material = Enum.Material.ForceField
+        hitbox.Transparency = settings.hitboxTransparency
+        hitbox.CanCollide = false
+        hitbox.CanTouch = false
+        hitbox.CanQuery = true
+        hitbox.Massless = true
+        hitbox.Anchored = false
+        hitbox.CFrame = root.CFrame
+        hitbox:SetAttribute("ChillyHitboxIgnoresWallCheck", true)
+        hitbox:SetAttribute("ChillyHitboxOwnerUserId", player.UserId)
+        hitbox:SetAttribute("ChillyHitboxTargetMode", settings.hitboxTargetMode)
+        hitbox.Parent = character
+
+        local weld = Instance.new("WeldConstraint")
+        weld.Part0 = hitbox
+        weld.Part1 = root
+        weld.Parent = hitbox
+
+        hitboxParts[player] = hitbox
+    end
+
+    hitbox.Shape = settings.hitboxShape == "Ball" and Enum.PartType.Ball or Enum.PartType.Block
+    hitbox.Size = getHitboxSize()
+    hitbox.Color = getHitboxColor(player)
+    hitbox.Transparency = settings.hitboxTransparency
+    hitbox:SetAttribute("ChillyHitboxTargetMode", settings.hitboxTargetMode)
+    hitbox.CFrame = root.CFrame
+end
+
+local function refreshHitboxes()
+    for _, player in ipairs(Players:GetPlayers()) do
+        updateHitboxForPlayer(player)
+    end
+end
+
+local function clearHitboxes()
+    for player in pairs(hitboxParts) do
+        destroyHitbox(player)
+    end
+end
+
+local function applyNoclip()
+    local character = getCharacter(localPlayer)
+    if not character then
+        return
+    end
+
+    if settings.noclipEnabled then
+        for _, descendant in ipairs(character:GetDescendants()) do
+            if descendant:IsA("BasePart") then
+                if originalCollisions[descendant] == nil then
+                    originalCollisions[descendant] = descendant.CanCollide
+                end
+
+                descendant.CanCollide = false
+            end
+        end
+        return
+    end
+
+    for part, canCollide in pairs(originalCollisions) do
+        if part and part.Parent then
+            part.CanCollide = canCollide
+        end
+        originalCollisions[part] = nil
+    end
+end
+
+local function applyFly(deltaTime)
+    local character = getCharacter(localPlayer)
+    local humanoid = getHumanoid(character)
+    local root = getRootPart(character)
+
+    if not character or not humanoid or not root then
+        return
+    end
+
+    if not settings.flyEnabled then
+        humanoid.PlatformStand = false
+        return
+    end
+
+    camera = workspace.CurrentCamera
+    if not camera then
+        return
+    end
+
+    local moveDirection = Vector3.new(0, 0, 0)
+
+    if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+        moveDirection = moveDirection + camera.CFrame.LookVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+        moveDirection = moveDirection - camera.CFrame.LookVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+        moveDirection = moveDirection + camera.CFrame.RightVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+        moveDirection = moveDirection - camera.CFrame.RightVector
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+        moveDirection = moveDirection + Vector3.new(0, 1, 0)
+    end
+    if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+        moveDirection = moveDirection - Vector3.new(0, 1, 0)
+    end
+
+    if moveDirection.Magnitude > 0 then
+        moveDirection = moveDirection.Unit
+    end
+
+    humanoid.PlatformStand = true
+    local targetVelocity = moveDirection * settings.flySpeed
+    local alpha = math.clamp((deltaTime or 1 / 60) * 12, 0.05, 0.6)
+    root.AssemblyLinearVelocity = root.AssemblyLinearVelocity:Lerp(targetVelocity, alpha)
+    root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+end
+
+local function teleportToPlayer(player)
+    if not player or player == localPlayer then
+        return
+    end
+
+    local localRoot = getLocalRootPart()
+    local targetRoot = getRootPart(getCharacter(player))
+
+    if not localRoot or not targetRoot then
+        return
+    end
+
+    localRoot.CFrame = targetRoot.CFrame * CFrame.new(0, 0, 4)
+    localRoot.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+end
+
+local function getTeleportPlayers()
+    local list = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= localPlayer and getCharacter(player) then
+            table.insert(list, player)
+        end
+    end
+
+    table.sort(list, function(a, b)
+        return a.Name:lower() < b.Name:lower()
+    end)
+
+    return list
+end
+
+local function ensureSelectedTeleportPlayer()
+    local list = getTeleportPlayers()
+
+    if #list == 0 then
+        selectedTeleportPlayer = nil
+        return nil
+    end
+
+    for _, player in ipairs(list) do
+        if player == selectedTeleportPlayer then
+            return selectedTeleportPlayer
+        end
+    end
+
+    selectedTeleportPlayer = list[1]
+    return selectedTeleportPlayer
+end
+
+local function cycleTeleportPlayer()
+    local list = getTeleportPlayers()
+
+    if #list == 0 then
+        selectedTeleportPlayer = nil
+        return
+    end
+
+    local currentIndex = nil
+    for index, player in ipairs(list) do
+        if player == selectedTeleportPlayer then
+            currentIndex = index
+            break
+        end
+    end
+
+    local nextIndex = currentIndex and currentIndex + 1 or 1
+    if nextIndex > #list then
+        nextIndex = 1
+    end
+
+    selectedTeleportPlayer = list[nextIndex]
+end
+
+local function destroyTool()
+    if isDestroyed then
+        return
+    end
+
+    isDestroyed = true
+    settings.enabled = false
+    settings.espCharm = false
+    settings.espBox = false
+    settings.espHealth = false
+    settings.hitboxExpander = false
+    settings.flyEnabled = false
+    settings.noclipEnabled = false
+    settings.infiniteJumpEnabled = false
+    refreshUi = nil
+
+    RunService:UnbindFromRenderStep(renderStepName)
+    setCurrentTarget(nil)
+    clearHitboxes()
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        destroyEsp(player)
+        destroyHitbox(player)
+    end
+
+    applyNoclip()
+
+    local humanoid = getLocalHumanoid()
+    if humanoid then
+        humanoid.PlatformStand = false
+    end
+
+    for _, connection in ipairs(connections) do
+        if connection then
+            connection:Disconnect()
+        end
+    end
+
+    table.clear(connections)
+
+    for player, connection in pairs(playerCharacterConnections) do
+        if connection then
+            connection:Disconnect()
+        end
+        playerCharacterConnections[player] = nil
+    end
+
+    if Chillys then
+        Chillys:Destroy()
+        Chillys = nil
+    end
+end
+
+local CHILLY_UI_URL = "https://raw.githubusercontent.com/lvkrhch/Chilly-s-Final-UI/refs/heads/main/Chilly's%20UI"
+
+local function createUi()
+    local loaded, libraryOrError = pcall(function()
+        return loadstring(game:HttpGet(CHILLY_UI_URL))()
+    end)
+
+    if not loaded or type(libraryOrError) ~= "table" then
+        error("[Chilly's Dev Tool] Failed to load Chilly's UI: " .. tostring(libraryOrError))
+    end
+
+    Chillys = libraryOrError
+
+    local window = Chillys.CreateLib("Chilly's Dev Tool", "Chilly")
+    local aimTab = window:NewTab("Aim")
+    local visualTab = window:NewTab("Visual")
+    local movementTab = window:NewTab("Movement")
+    local teleportTab = window:NewTab("Teleport")
+    local systemTab = window:NewTab("System")
+
+    local aimSection = aimTab:NewSection("Aim Assist")
+    local aimSettingsSection = aimTab:NewSection("Aim Settings")
+    local visualSection = visualTab:NewSection("ESP")
+    local hitboxSection = visualTab:NewSection("Hitbox Debug")
+    local movementSection = movementTab:NewSection("Character")
+    local teleportSection = teleportTab:NewSection("Player Teleport")
+    local systemSection = systemTab:NewSection("Tool")
+
+    local ui = {}
+    local isRefreshingUi = false
+
+    ui.status = aimSection:NewLabel("Status: loading...")
+    ui.aimToggle = aimSection:NewToggle("Aim Lock", "Enable or disable aim lock.", function(value)
+        if isRefreshingUi or isDestroyed then
+            return
+        end
+
+        settings.enabled = value
+        if settings.enabled and not currentTarget then
+            setCurrentTarget(getBestTarget())
+        elseif not settings.enabled then
+            setCurrentTarget(nil)
+        end
+
+        refreshUi()
+    end)
+
+    aimSection:NewButton("Switch Target", "Cycle to the next valid target.", function()
+        cycleTarget()
+        refreshUi()
+    end)
+
+    ui.wallCheck = aimSection:NewToggle("Wall Check", "Require a clear line of sight.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.wallCheck = value
+        if settings.enabled then
+            setCurrentTarget(getBestTarget())
+        end
+        refreshUi()
+    end)
+
+    ui.retarget = aimSection:NewToggle("Retarget Every Frame", "Continuously choose the best target.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.retargetEveryFrame = value
+    end)
+
+    ui.aimPart = aimSettingsSection:NewButton("", "Switch between head and body.", function()
+        settings.aimPart = settings.aimPart == "Head" and "Body" or "Head"
+        if settings.enabled then
+            setCurrentTarget(getBestTarget())
+        end
+        refreshUi()
+    end)
+
+    ui.targetMode = aimSettingsSection:NewButton("", "Switch target priority between FOV and distance.", function()
+        settings.targetMode = settings.targetMode == "FOV" and "Distance" or "FOV"
+        if settings.enabled then
+            setCurrentTarget(getBestTarget())
+        end
+        refreshUi()
+    end)
+
+    ui.teamMode = aimSettingsSection:NewButton("", "Cycle Auto, FFA, and Team mode.", function()
+        cycleTeamMode()
+        refreshEsp()
+        clearHitboxes()
+        if settings.enabled then
+            setCurrentTarget(getBestTarget())
+        end
+        refreshUi()
+    end)
+
+    ui.aimKey = aimSettingsSection:NewButton("", "Cycle the aim-lock hotkey.", function()
+        settings.aimToggleKey = getNextKey(settings.aimToggleKey)
+        if settings.aimToggleKey == settings.targetSwitchKey then
+            settings.targetSwitchKey = getNextKey(settings.targetSwitchKey)
+        end
+        refreshUi()
+    end)
+
+    ui.switchKey = aimSettingsSection:NewButton("", "Cycle the target-switch hotkey.", function()
+        settings.targetSwitchKey = getNextKey(settings.targetSwitchKey)
+        if settings.targetSwitchKey == settings.aimToggleKey then
+            settings.targetSwitchKey = getNextKey(settings.targetSwitchKey)
+        end
+        refreshUi()
+    end)
+
+    ui.fov = aimSettingsSection:NewSlider("FOV Radius", "Aim radius used in FOV mode.", 500, 50, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.fovRadius = value
+        if settings.enabled and settings.targetMode == "FOV" then
+            setCurrentTarget(getBestTarget())
+        end
+    end)
+
+    ui.smoothness = aimSettingsSection:NewSlider("Smoothness", "Higher values move the camera more smoothly.", 98, 5, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.smoothness = value / 100
+    end)
+
+    ui.espCharm = visualSection:NewToggle("ESP Highlight", "Show a highlight on valid players.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.espCharm = value
+        refreshEsp()
+    end)
+
+    ui.espBox = visualSection:NewToggle("ESP Box", "Show a box around valid players.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.espBox = value
+        refreshEsp()
+    end)
+
+    ui.espHealth = visualSection:NewToggle("ESP Health", "Show player health information.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.espHealth = value
+        refreshEsp()
+    end)
+
+    ui.hitbox = hitboxSection:NewToggle("Hitbox Debug", "Enable the client-side hitbox helper.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.hitboxExpander = value
+        if not value then
+            clearHitboxes()
+        end
+    end)
+
+    ui.hitboxSize = hitboxSection:NewSlider("Hitbox Size", "Set the debug hitbox size.", settings.maxHitboxSize, settings.minHitboxSize, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.hitboxSize = value
+    end)
+
+    ui.hitboxShape = hitboxSection:NewButton("", "Switch between box and ball hitboxes.", function()
+        cycleHitboxShape()
+        clearHitboxes()
+        refreshUi()
+    end)
+
+    ui.hitboxMode = hitboxSection:NewButton("", "Cycle Enemies, Target, and All.", function()
+        cycleHitboxTargetMode()
+        clearHitboxes()
+        refreshUi()
+    end)
+
+    ui.fly = movementSection:NewToggle("Fly", "Enable local flight controls.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.flyEnabled = value
+        if not value then
+            local humanoid = getLocalHumanoid()
+            if humanoid then
+                humanoid.PlatformStand = false
+            end
+        end
+    end)
+
+    ui.noclip = movementSection:NewToggle("Noclip", "Disable local character collisions.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.noclipEnabled = value
+        if not value then
+            applyNoclip()
+        end
+    end)
+
+    ui.infiniteJump = movementSection:NewToggle("Infinite Jump", "Allow repeated jumps while airborne.", function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.infiniteJumpEnabled = value
+    end)
+
+    ui.walkSpeed = movementSection:NewSlider("Walk Speed", "Set local walk speed.", settings.maxWalkSpeed, settings.minWalkSpeed, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.walkSpeed = value
+        applyMovementSettings()
+    end)
+
+    ui.jumpPower = movementSection:NewSlider("Jump Power", "Set local jump power.", settings.maxJumpPower, settings.minJumpPower, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.jumpPower = value
+        settings.useJumpPower = true
+        applyMovementSettings()
+    end)
+
+    ui.flySpeed = movementSection:NewSlider("Fly Speed", "Set local fly speed.", settings.maxFlySpeed, settings.minFlySpeed, function(value)
+        if isRefreshingUi then
+            return
+        end
+        settings.flySpeed = value
+    end)
+
+    movementSection:NewButton("Reset Movement", "Restore movement values captured from the game.", function()
+        resetMovementToGameDefaults()
+        refreshUi()
+    end)
+
+    ui.teleportTarget = teleportSection:NewButton("", "Cycle through available players.", function()
+        cycleTeleportPlayer()
+        refreshUi()
+    end)
+
+    teleportSection:NewButton("Teleport", "Teleport to the currently selected player.", function()
+        teleportToPlayer(ensureSelectedTeleportPlayer())
+        refreshUi()
+    end)
+
+    systemSection:NewLabel("Chilly's Dev Tool - own-experience testing")
+    systemSection:NewButton("Destroy Tool", "Disable features, clean overlays, and remove the UI.", function()
+        destroyTool()
+    end)
+
+    refreshUi = function()
+        if isDestroyed or not Chillys then
+            return
+        end
+
+        isRefreshingUi = true
+
+        local targetName = currentTarget and currentTarget.Name or "None"
+        local selectedPlayer = ensureSelectedTeleportPlayer()
+        local selectedName = selectedPlayer and selectedPlayer.Name or "No players"
+
+        ui.status:UpdateLabel(getTeamModeLabel() .. " | Target: " .. targetName)
+        ui.aimToggle:UpdateToggle("Aim Lock", settings.enabled)
+        ui.wallCheck:UpdateToggle("Wall Check", settings.wallCheck)
+        ui.retarget:UpdateToggle("Retarget Every Frame", settings.retargetEveryFrame)
+        ui.aimPart:UpdateButton("Aim Part: " .. settings.aimPart)
+        ui.targetMode:UpdateButton("Target Mode: " .. settings.targetMode)
+        ui.teamMode:UpdateButton("Match: " .. settings.teamMode)
+        ui.aimKey:UpdateButton("Aim Key: " .. settings.aimToggleKey.Name)
+        ui.switchKey:UpdateButton("Switch Key: " .. settings.targetSwitchKey.Name)
+        ui.fov:UpdateSlider(settings.fovRadius)
+        ui.smoothness:UpdateSlider(math.floor(settings.smoothness * 100))
+
+        ui.espCharm:UpdateToggle("ESP Highlight", settings.espCharm)
+        ui.espBox:UpdateToggle("ESP Box", settings.espBox)
+        ui.espHealth:UpdateToggle("ESP Health", settings.espHealth)
+        ui.hitbox:UpdateToggle("Hitbox Debug", settings.hitboxExpander)
+        ui.hitboxSize:UpdateSlider(settings.hitboxSize)
+        ui.hitboxShape:UpdateButton("Hitbox Shape: " .. settings.hitboxShape)
+        ui.hitboxMode:UpdateButton("Hitbox Mode: " .. settings.hitboxTargetMode)
+
+        ui.fly:UpdateToggle("Fly", settings.flyEnabled)
+        ui.noclip:UpdateToggle("Noclip", settings.noclipEnabled)
+        ui.infiniteJump:UpdateToggle("Infinite Jump", settings.infiniteJumpEnabled)
+        ui.walkSpeed:UpdateSlider(settings.walkSpeed)
+        ui.jumpPower:UpdateSlider(settings.jumpPower)
+        ui.flySpeed:UpdateSlider(settings.flySpeed)
+        ui.teleportTarget:UpdateButton("Target: " .. selectedName)
+
+        isRefreshingUi = false
+    end
+
+    refreshUi()
+end
+trackConnection(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if isDestroyed then
+        return
+    end
+
+    if input.KeyCode == settings.menuKey and Chillys then
+        Chillys:ToggleUI()
+        return
+    end
+
+    if gameProcessed then
+        return
+    end
+
+    if input.KeyCode == settings.aimToggleKey then
+        settings.enabled = not settings.enabled
+
+        if settings.enabled and not currentTarget then
+            setCurrentTarget(getBestTarget())
+        elseif not settings.enabled then
+            setCurrentTarget(nil)
+        end
+
+        if refreshUi then
+            refreshUi()
+        end
+        return
+    end
+
+    if input.KeyCode == settings.targetSwitchKey then
+        cycleTarget()
+        if refreshUi then
+            refreshUi()
+        end
+    end
+end))
+
+
+trackConnection(UserInputService.JumpRequest:Connect(function()
+    if isDestroyed then
+        return
+    end
+
+    if not settings.infiniteJumpEnabled then
+        return
+    end
+
+    local humanoid = getLocalHumanoid()
+    if humanoid then
+        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+    end
+end))
+
+trackConnection(Players.PlayerRemoving:Connect(function(player)
+    if isDestroyed then
+        return
+    end
+
+    destroyEsp(player)
+    destroyHitbox(player)
+
+    if currentTarget == player then
+        setCurrentTarget(nil)
+    end
+
+    if selectedTeleportPlayer == player then
+        selectedTeleportPlayer = nil
+    end
+
+    if playerCharacterConnections[player] then
+        playerCharacterConnections[player]:Disconnect()
+        playerCharacterConnections[player] = nil
+    end
+end))
+
+trackConnection(Players.PlayerAdded:Connect(function(player)
+    if isDestroyed then
+        return
+    end
+
+    playerCharacterConnections[player] = player.CharacterAdded:Connect(function()
+        if isDestroyed then
+            return
+        end
+
+        task.wait(0.25)
+        if refreshUi and not isDestroyed then
+            refreshUi()
+        end
+    end)
+end))
+
+for _, player in ipairs(Players:GetPlayers()) do
+    if player ~= localPlayer then
+        playerCharacterConnections[player] = player.CharacterAdded:Connect(function()
+            if isDestroyed then
+                return
+            end
+
+            task.wait(0.25)
+            if refreshUi and not isDestroyed then
+                refreshUi()
+            end
+        end)
+    end
+end
+
+trackConnection(localPlayer.CharacterAdded:Connect(function()
+    if isDestroyed then
+        return
+    end
+
+    task.wait(0.2)
+    originalCollisions = {}
+    baseMovementSettings = nil
+    captureBaseMovementSettings(true)
+    applyMovementSettings()
+end))
+
+RunService:BindToRenderStep(renderStepName, Enum.RenderPriority.Camera.Value + 1, function(deltaTime)
+    if isDestroyed then
+        return
+    end
+
+    camera = workspace.CurrentCamera
+
+    refreshEsp()
+    refreshHitboxes()
+    applyMovementSettings()
+    applyNoclip()
+    applyFly(deltaTime)
+
+    if not camera or not settings.enabled then
+        return
+    end
+
+    if settings.retargetEveryFrame or not currentTarget or not isValidTarget(currentTarget) then
+        setCurrentTarget(getBestTarget())
+    end
+
+    if currentTarget then
+        local character = getCharacter(currentTarget)
+        local humanoid = getHumanoid(character)
+        local targetPart = getAimPart(character)
+
+        if not humanoid or humanoid.Health <= 0 or humanoid:GetState() == Enum.HumanoidStateType.Dead then
+            setCurrentTarget(nil)
+            return
+        end
+
+        if targetPart and hasLineOfSight(character, targetPart) then
+            aimAt(targetPart, deltaTime)
+        else
+            setCurrentTarget(nil)
+        end
+    end
+end)
+
+captureBaseMovementSettings(true)
+createUi()
 
