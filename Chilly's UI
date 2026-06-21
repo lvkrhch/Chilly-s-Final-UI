@@ -9,6 +9,7 @@ local TweenService = game:GetService("TweenService")
 local UserInputService = game:GetService("UserInputService")
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
+local RunService = game:GetService("RunService")
 local TweenInfoNew = TweenInfo.new
 
 local Utility = {}
@@ -2796,4 +2797,41 @@ function Chillys.CreateLib(windowName, themeList)
     return Tabs
 end
 Chillys.CreateWindow = Chillys.CreateLib
+
+function Chillys:Start()
+    if activeGui and activeGui.Parent then
+        activeGui.Enabled = true
+        return activeGui
+    end
+
+    if not RunService:IsClient() then
+        warn("[Chilly's UI] GUI must be executed from a LocalScript/client.")
+        return nil
+    end
+
+    local window = Chillys.CreateLib("Chilly's", "Chilly")
+    local homeTab = window:NewTab("Home")
+    local homeSection = homeTab:NewSection("Chilly's UI")
+
+    homeSection:NewLabel("Chilly's UI berhasil dimuat.")
+    homeSection:NewKeybind(
+        "Tampilkan / Sembunyikan GUI",
+        "Tekan RightControl untuk membuka atau menyembunyikan GUI.",
+        Enum.KeyCode.RightControl,
+        function()
+            Chillys:ToggleUI()
+        end
+    )
+
+    return activeGui
+end
+
+local started, startError = pcall(function()
+    Chillys:Start()
+end)
+
+if not started then
+    warn("[Chilly's UI] Failed to start:", startError)
+end
+
 return Chillys
